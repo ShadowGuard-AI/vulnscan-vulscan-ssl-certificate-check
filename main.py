@@ -99,6 +99,8 @@ def check_chain_trust(host, port, ca_file=None):
     try:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         if ca_file:
+            # A ca file that cannot be loaded raises here and lands in the generic handler below,
+            # so a bad path of mine reads in the output as the server's chain being untrusted.
             context.load_verify_locations(cafile=ca_file)
         ssl_sock = _connect(host, port, context)
         return True, None
@@ -114,6 +116,9 @@ def check_chain_trust(host, port, ca_file=None):
 def _parse_asn1_time(raw):
     """Parse a pyOpenSSL ASN.1 time value (bytes) into an aware UTC datetime."""
     text = raw.decode("ascii") if isinstance(raw, bytes) else str(raw)
+    # The two digit year branch leans on strptime's %y pivot, which places years 50 to 68 in
+    # the 2000s. UTCTime places 50 to 99 in the 1900s, so a certificate stamped in that
+    # range would parse a century late here. GeneralizedTime is the common case by now.
     for fmt in ("%Y%m%d%H%M%SZ", "%y%m%d%H%M%SZ"):
         try:
             return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
@@ -144,6 +149,8 @@ def check_certificate_validity(cert):
             return "not_yet_valid", not_after, None
         if now > not_after:
             return "expired", not_after, None
+        # .days floors what is left, so a certificate inside its final day reports 0 days even
+        # though this same return calls it valid.
         return "valid", not_after, (not_after - now).days
     except Exception as e:
         logging.error(f"Error during certificate validity check: {e}")
@@ -329,6 +336,9 @@ def main():
     else:
         logging.warning("Hostname match: could not be determined.")
 
+    # This is the second of three separate connections I open, the cipher check below being
+    # the third. On a host balanced across backends with different certificates, the trust
+    # verdict, the cipher, and the details above can each describe a different certificate.
     trusted, trust_reason = check_chain_trust(host, port, args.ca_file)
     if trusted:
         logging.info("Chain trust: a verifying connection succeeded; the chain is trusted.")
@@ -340,6 +350,8 @@ def main():
         logging.info(f"Cipher negotiated on the inspection connection: {', '.join([cipher[0] for cipher in ciphers])}")
 
     get_certificate_details(cert)
+    # Exit 0 covers every finding, expired and untrusted included, as the docstring above sets
+    # out. A caller who wants to gate on trust has to read these log lines, not the code.
     return 0
 
 
