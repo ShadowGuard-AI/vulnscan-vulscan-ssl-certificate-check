@@ -99,8 +99,6 @@ def check_chain_trust(host, port, ca_file=None):
     try:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         if ca_file:
-            # A ca file that cannot be loaded raises here and lands in the generic handler below,
-            # so a bad path of mine reads in the output as the server's chain being untrusted.
             context.load_verify_locations(cafile=ca_file)
         ssl_sock = _connect(host, port, context)
         return True, None
@@ -116,14 +114,21 @@ def check_chain_trust(host, port, ca_file=None):
 def _parse_asn1_time(raw):
     """Parse a pyOpenSSL ASN.1 time value (bytes) into an aware UTC datetime."""
     text = raw.decode("ascii") if isinstance(raw, bytes) else str(raw)
-    # The two digit year branch leans on strptime's %y pivot, which places years 50 to 68 in
-    # the 2000s. UTCTime places 50 to 99 in the 1900s, so a certificate stamped in that
-    # range would parse a century late here. GeneralizedTime is the common case by now.
-    for fmt in ("%Y%m%d%H%M%SZ", "%y%m%d%H%M%SZ"):
+    try:
+        return datetime.strptime(text, "%Y%m%d%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    # UTCTime uses a two digit year: 50 to 99 mean 1950 to 1999 and
+    # 00 to 49 mean 2000 to 2049. strptime %y uses a different pivot
+    # (69), so parse the year explicitly instead of relying on it.
+    if len(text) == 13 and text[:2].isdigit():
+        yy = int(text[:2])
+        year = 1900 + yy if yy >= 50 else 2000 + yy
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            rest = datetime.strptime(text[2:], "%m%d%H%M%SZ")
+            return rest.replace(year=year, tzinfo=timezone.utc)
         except ValueError:
-            continue
+            pass
     raise ValueError(f"Unrecognized certificate time format: {text}")
 
 
@@ -149,8 +154,6 @@ def check_certificate_validity(cert):
             return "not_yet_valid", not_after, None
         if now > not_after:
             return "expired", not_after, None
-        # .days floors what is left, so a certificate inside its final day reports 0 days even
-        # though this same return calls it valid.
         return "valid", not_after, (not_after - now).days
     except Exception as e:
         logging.error(f"Error during certificate validity check: {e}")
@@ -296,6 +299,14 @@ def main():
     host = args.host
     port = args.port
 
+    if args.ca_file:
+        try:
+            _probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            _probe.load_verify_locations(cafile=args.ca_file)
+        except Exception as e:
+            logging.error(f"Failed to load --ca-file {args.ca_file}: {e}")
+            return 1
+
     if not isinstance(port, int) or port <= 0 or port > 65535:
         logging.error("Invalid port number. Please provide a valid port number between 1 and 65535.")
         return 1
@@ -315,7 +326,10 @@ def main():
     if state == "valid":
         logging.info("Date validity: certificate is within its validity window.")
         if expiry_date and days_to_expiry is not None:
-            logging.info(f"Certificate expires on: {expiry_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (in {days_to_expiry} days)")
+            if days_to_expiry == 0:
+                logging.info(f"Certificate expires on: {expiry_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (less than 1 day)")
+            else:
+                logging.info(f"Certificate expires on: {expiry_date.strftime('%Y-%m-%d %H:%M:%S')} UTC (in {days_to_expiry} days)")
     elif state == "expired":
         logging.warning("Date validity: certificate has EXPIRED.")
         if expiry_date:
@@ -336,9 +350,9 @@ def main():
     else:
         logging.warning("Hostname match: could not be determined.")
 
-    # This is the second of three separate connections I open, the cipher check below being
-    # the third. On a host balanced across backends with different certificates, the trust
-    # verdict, the cipher, and the details above can each describe a different certificate.
+    # This is the second of three separate connections; the cipher
+    # check below is the third. See the README note on load balanced
+    # hosts, where separate connections could reach different backends.
     trusted, trust_reason = check_chain_trust(host, port, args.ca_file)
     if trusted:
         logging.info("Chain trust: a verifying connection succeeded; the chain is trusted.")
@@ -350,8 +364,8 @@ def main():
         logging.info(f"Cipher negotiated on the inspection connection: {', '.join([cipher[0] for cipher in ciphers])}")
 
     get_certificate_details(cert)
-    # Exit 0 covers every finding, expired and untrusted included, as the docstring above sets
-    # out. A caller who wants to gate on trust has to read these log lines, not the code.
+    # Exit 0 covers every finding, expired and untrusted included.
+    # A caller who wants to gate on trust must read the log lines.
     return 0
 
 
